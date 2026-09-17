@@ -15,6 +15,7 @@ cctokens — 查看 Claude Code 的 token 消耗按项目分布
   cctokens --all           全部历史（数据量大时较慢）
   cctokens --sessions      额外列出最烧 token 的单次会话
   cctokens --auto          识别疑似定时/无人值守任务（cron、SDK、重复 prompt）
+  cctokens --context       诊断上下文膨胀：每请求上下文、会话起步注入量
   cctokens --json          输出 JSON
   cctokens --dir ~/.claude 指定 Claude 配置目录
 """
@@ -58,6 +59,7 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--sessions", action="store_true")
     ap.add_argument("--auto", action="store_true")
+    ap.add_argument("--context", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--dir", default="~/.claude")
@@ -86,6 +88,9 @@ def main():
     mtime_cut = datetime.datetime.combine(start, datetime.time.min).timestamp()
     proj, days, models, sess, cwds = {}, {}, {}, {}, {}
     meta = {}          # sid -> 会话元信息，供 --auto 分析
+    ctxs = []          # 每次请求携带的上下文，供 --context 分析
+    firsts = {}        # sid -> 该会话第 1 次请求的上下文
+    reqs = {}          # sid -> 请求数
     tot = dict(inp=0, out=0, cw=0, cr=0)
     nreq = 0
     seen = set()
@@ -161,6 +166,15 @@ def main():
                 m = msg.get("model") or "unknown"
                 models[m] = models.get(m, 0) + v
                 sess[(key, sid)] = sess.get((key, sid), 0) + v
+                if a.context:
+                    # 一次请求实际携带的上下文 = 输入 + 缓存写 + 缓存读（不含输出）
+                    c = (u.get("input_tokens", 0)
+                         + u.get("cache_creation_input_tokens", 0)
+                         + u.get("cache_read_input_tokens", 0))
+                    ctxs.append(c)
+                    reqs[sid] = reqs.get(sid, 0) + 1
+                    if sid not in firsts:
+                        firsts[sid] = c
                 if a.auto:
                     m0 = meta.setdefault(sid, {"first": None, "start": None,
                                               "turns": 0, "ep": set(), "tok": 0, "proj": key})
@@ -230,6 +244,38 @@ def main():
         print(f"\n  按模型\n")
         for m, v in sorted(models.items(), key=lambda x: -x[1]):
             print(f"  {m:<32} {human(v):>8} {v/total*100:>5.1f}%")
+
+    if a.context:
+        import statistics
+
+        def stat(vals, label, note=""):
+            if not vals:
+                return
+            sv = sorted(vals)
+            print(f"  {label}")
+            print(f"    平均 {statistics.mean(sv)/1000:>7,.0f}K"
+                  f"   中位数 {statistics.median(sv)/1000:>7,.0f}K"
+                  f"   P90 {sv[min(len(sv)-1, int(len(sv)*.9))]/1000:>7,.0f}K"
+                  f"   最大 {sv[-1]/1000:>7,.0f}K")
+            if note:
+                print(f"    {note}")
+            print()
+
+        print(f"\n  上下文诊断\n")
+        stat(ctxs, "每次请求携带的上下文（输入 + 缓存写 + 缓存读，不含输出）")
+        stat(list(firsts.values()), "会话起步时的上下文（第 1 次请求）",
+             "起步量大 = 新会话一开始就被注入大量内容（CLAUDE.md、自动读取的文件、resume 的历史）")
+        if reqs:
+            rv = sorted(reqs.values())
+            print(f"  每个会话的请求数")
+            print(f"    平均 {statistics.mean(rv):>7,.0f}"
+                  f"    中位数 {statistics.median(rv):>7,.0f}"
+                  f"    最大 {rv[-1]:>7,}\n")
+        print("  参考基线（一台纯人工交互的 Claude Code，7 天 47 个会话）：")
+        print("    每请求上下文 中位数 362K · P90 839K")
+        print("    会话起步     中位数  80K")
+        print("    每会话请求数 中位数 118")
+        print("  高于基线数倍才说明存在额外注入；总量差异更常来自请求次数，不是单次上下文。")
 
     if a.auto:
         print(f"\n  疑似定时 / 无人值守任务\n")

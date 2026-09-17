@@ -32,6 +32,7 @@ cctokens --since 2026-09-01 # 指定起始日期
 cctokens --all              # 全部历史（数据量大时较慢）
 cctokens --sessions         # 额外列出最烧 token 的单次会话
 cctokens --auto             # 识别疑似定时 / 无人值守任务
+cctokens --context          # 诊断上下文膨胀
 cctokens --json             # 输出 JSON，供脚本消费
 cctokens --top 30           # 项目排名显示条数，默认 20
 cctokens --dir ~/.claude    # 指定 Claude 配置目录
@@ -97,6 +98,35 @@ ls ~/Library/LaunchAgents                # macOS 用户级
 launchctl list | grep -v com.apple       # macOS 运行中（第 2 列是退出码，非 0 即失败）
 systemctl --user list-timers             # Linux
 ```
+
+## 诊断上下文膨胀
+
+`--context` 用来回答「是不是每个会话一开张就被塞了一堆东西」。
+
+```bash
+cctokens --days 7 --context
+```
+
+三组指标：
+
+- **每次请求携带的上下文** = 输入 + 缓存写 + 缓存读。模型无状态，每轮都要重发
+  整个历史，这个数是每轮实际拖着的体量
+- **会话起步时的上下文**（第 1 次请求）= 新会话一开张就被注入的量。
+  CLAUDE.md、自动读取的文件、`--resume` 带回的历史都算在这里。
+  **这一项是判断「自动读上下文」类配置有没有失控的关键指标**
+- **每个会话的请求数** = 起步那笔注入被重复读取的倍数
+
+参考基线（一台纯人工交互的 Claude Code，7 天 47 个会话）：
+
+| 指标 | 中位数 | P90 |
+|---|---|---|
+| 每请求上下文 | 362K | 839K |
+| 会话起步 | 80K | 812K |
+| 每会话请求数 | 118 | — |
+
+**判读**：每请求上下文在 300–500K 是 Claude Code 长会话的常态，不是异常。
+两台机器总量差几倍，通常来自**请求次数**而非单次上下文大小——先比请求数再比上下文。
+只有会话起步中位数高出基线数倍，才说明存在额外注入。
 
 ## 统计口径
 
