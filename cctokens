@@ -14,6 +14,7 @@ cctokens — 查看 Claude Code 的 token 消耗按项目分布
   cctokens --since 2026-09-01
   cctokens --all           全部历史（数据量大时较慢）
   cctokens --sessions      额外列出最烧 token 的单次会话
+  cctokens --auto          识别疑似定时/无人值守任务（cron、SDK、重复 prompt）
   cctokens --json          输出 JSON
   cctokens --dir ~/.claude 指定 Claude 配置目录
 """
@@ -56,6 +57,7 @@ def main():
     ap.add_argument("--today", action="store_true")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--sessions", action="store_true")
+    ap.add_argument("--auto", action="store_true")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--dir", default="~/.claude")
@@ -83,6 +85,7 @@ def main():
 
     mtime_cut = datetime.datetime.combine(start, datetime.time.min).timestamp()
     proj, days, models, sess, cwds = {}, {}, {}, {}, {}
+    meta = {}          # sid -> 会话元信息，供 --auto 分析
     tot = dict(inp=0, out=0, cw=0, cr=0)
     nreq = 0
     seen = set()
@@ -100,6 +103,26 @@ def main():
             continue
         with fh:
             for line in fh:
+                if a.auto and '"role":"user"' in line.replace(' ', ''):
+                    try: du = json.loads(line)
+                    except Exception: du = None
+                    if du and du.get("type") == "user":
+                        mu = du.get("message") or {}
+                        tx = mu.get("content")
+                        if isinstance(tx, list):
+                            tx = next((b.get("text", "") for b in tx
+                                       if isinstance(b, dict) and b.get("type") == "text"), "")
+                        # 排除系统注入与交互中敲的斜杠命令包装，它们不是任务 prompt
+                        if isinstance(tx, str) and tx.strip() and not tx.startswith(
+                                ("<system-reminder", "[Request interrupted", "<local-command",
+                                 "<command-name", "<command-message", "<command-args",
+                                 "<user-prompt-submit-hook")):
+                            m0 = meta.setdefault(sid, {"first": None, "start": None,
+                                                       "turns": 0, "ep": set(), "tok": 0, "proj": key})
+                            m0["turns"] += 1
+                            if m0["first"] is None:
+                                m0["first"] = " ".join(tx.split())[:120]
+                                m0["start"] = du.get("timestamp")
                 if '"usage"' not in line:
                     continue
                 try:
@@ -138,6 +161,11 @@ def main():
                 m = msg.get("model") or "unknown"
                 models[m] = models.get(m, 0) + v
                 sess[(key, sid)] = sess.get((key, sid), 0) + v
+                if a.auto:
+                    m0 = meta.setdefault(sid, {"first": None, "start": None,
+                                              "turns": 0, "ep": set(), "tok": 0, "proj": key})
+                    m0["tok"] += v
+                    if d.get("entrypoint"): m0["ep"].add(d["entrypoint"])
                 if key not in cwds and d.get("cwd"):
                     cwds[key] = d["cwd"]
 
@@ -202,6 +230,65 @@ def main():
         print(f"\n  按模型\n")
         for m, v in sorted(models.items(), key=lambda x: -x[1]):
             print(f"  {m:<32} {human(v):>8} {v/total*100:>5.1f}%")
+
+    if a.auto:
+        print(f"\n  疑似定时 / 无人值守任务\n")
+        print("  判据：① 非交互入口（SDK / headless / cron）  ② 同一 prompt 跨天重复"
+              "  ③ 触发时刻规律  ④ 无后续人类回合\n")
+        # 按首条 prompt 归组
+        groups = {}
+        for sid, m0 in meta.items():
+            if not m0.get("first") or not m0.get("tok"):
+                continue
+            groups.setdefault(m0["first"], []).append(m0)
+        hits = []
+        for prompt, ms in groups.items():
+            times = []
+            for m0 in ms:
+                try:
+                    times.append(datetime.datetime.fromisoformat(
+                        m0["start"].replace("Z", "+00:00")).astimezone())
+                except Exception:
+                    pass
+            tok = sum(m0["tok"] for m0 in ms)
+            eps = set().union(*(m0["ep"] for m0 in ms))
+            reasons = []
+            # 只有明确的非交互入口才算自动化信号；
+            # cli / claude-desktop / vscode / jetbrains 都是人坐在前面用的
+            auto_ep = {e for e in eps
+                       if any(k in e.lower() for k in ("sdk", "headless", "cron", "action", "api"))}
+            if auto_ep:
+                reasons.append("入口 " + ",".join(sorted(auto_ep)))
+            if len(ms) >= 2 and len({t.date() for t in times}) >= 2:
+                reasons.append(f"跨 {len({t.date() for t in times})} 天重复 {len(ms)} 次")
+                # 触发时刻是否集中在同一分钟窗口
+                mins = sorted(t.hour * 60 + t.minute for t in times)
+                if mins and mins[-1] - mins[0] <= 5:
+                    reasons.append(f"固定时刻 {times[0]:%H:%M} 前后")
+            if all(m0["turns"] <= 1 for m0 in ms) and len(ms) >= 2:
+                reasons.append("无后续人类回合")
+            if reasons:
+                hits.append((tok, prompt, ms, times, reasons))
+        if not hits:
+            print("  未发现。该区间内的会话均为交互式人工使用。\n")
+            print("  若怀疑别处有定时任务，在目标机器上执行：")
+            print("    crontab -l                         # 用户级定时")
+            print("    sudo crontab -l                    # root 级定时")
+            print("    ls ~/Library/LaunchAgents           # macOS 登录项")
+            print("    launchctl list | grep -v com.apple  # macOS 常驻服务")
+            print("    grep -rl 'claude' /etc/cron.* 2>/dev/null")
+        else:
+            hits.sort(reverse=True, key=lambda x: x[0])
+            auto_tok = sum(h[0] for h in hits)
+            for tok, prompt, ms, times, reasons in hits[:15]:
+                print(f"  {human(tok):>8} {tok/total*100:>5.1f}%   {' / '.join(reasons)}")
+                print(f"           prompt: {shorten(prompt, W - 22)}")
+                ts = "  ".join(f"{t:%m-%d %H:%M:%S}" for t in sorted(times)[:6])
+                more = f"  …共 {len(times)} 次" if len(times) > 6 else ""
+                print(f"           触发: {ts}{more}")
+                print(f"           项目: {shorten(name_of(ms[0]['proj']), W - 22)}\n")
+            print(f"  疑似自动任务合计 {human(auto_tok)}"
+                  f"，占区间总量 {auto_tok/total*100:.1f}%")
 
     if a.sessions:
         print(f"\n  最烧 token 的会话\n")
