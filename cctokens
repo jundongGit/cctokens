@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cctokens — 查看 Claude Code 的 token 消耗按项目分布
+
+纯本地：只读 ~/.claude/projects 下的会话日志，不联网、不调 API、
+不需要 Claude Code 能运行。额度用满的机器上照样可用。
+
+用法:
+  cctokens                 最近 7 天
+  cctokens --days 30       最近 30 天
+  cctokens --month         本月
+  cctokens --today         今天
+  cctokens --since 2026-09-01
+  cctokens --all           全部历史（数据量大时较慢）
+  cctokens --sessions      额外列出最烧 token 的单次会话
+  cctokens --json          输出 JSON
+  cctokens --dir ~/.claude 指定 Claude 配置目录
+"""
+import json, os, sys, glob, argparse, datetime, shutil
+
+def dwidth(s):
+    """字符串在终端里的显示宽度：中日韩全角字符占 2 格。"""
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+def pad(s, w):
+    """按显示宽度左对齐补空格。"""
+    return s + " " * max(0, w - dwidth(s))
+
+def human(n):
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            return f"{n/div:,.1f}{unit}"
+    return f"{n:,}"
+
+def shorten(p, width):
+    if dwidth(p) <= width:
+        return p
+    head, tail = "", ""
+    hw = tw = 0
+    half = (width - 3) // 2
+    for c in p:
+        if hw + dwidth(c) > half: break
+        head += c; hw += dwidth(c)
+    for c in reversed(p):
+        if tw + dwidth(c) > width - 3 - hw: break
+        tail = c + tail; tw += dwidth(c)
+    return head + "..." + tail
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--days", type=int)
+    ap.add_argument("--since")
+    ap.add_argument("--month", action="store_true")
+    ap.add_argument("--today", action="store_true")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--sessions", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--dir", default="~/.claude")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__); return
+
+    today = datetime.date.today()
+    if a.all:        start, label = datetime.date(2000, 1, 1), "全部历史"
+    elif a.today:    start, label = today, "今天"
+    elif a.month:    start, label = today.replace(day=1), "本月"
+    elif a.since:    start, label = datetime.date.fromisoformat(a.since), f"{a.since} 起"
+    else:
+        d = a.days if a.days else 7
+        start, label = today - datetime.timedelta(days=d - 1), f"最近 {d} 天"
+
+    base = os.path.join(os.path.expanduser(a.dir), "projects")
+    if not os.path.isdir(base):
+        sys.exit(f"找不到会话日志目录: {base}\n用 --dir 指定 Claude 配置目录")
+
+    files = glob.glob(os.path.join(base, "*", "*.jsonl"))
+    if not files:
+        sys.exit(f"{base} 下没有会话日志")
+
+    mtime_cut = datetime.datetime.combine(start, datetime.time.min).timestamp()
+    proj, days, models, sess, cwds = {}, {}, {}, {}, {}
+    tot = dict(inp=0, out=0, cw=0, cr=0)
+    nreq = 0
+    seen = set()
+    scanned = 0
+
+    for f in files:
+        if not a.all and os.path.getmtime(f) < mtime_cut:
+            continue
+        scanned += 1
+        key = os.path.basename(os.path.dirname(f))
+        sid = os.path.basename(f)[:-6]
+        try:
+            fh = open(f, encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                ts = d.get("timestamp")
+                if not ts:
+                    continue
+                try:
+                    day = datetime.datetime.fromisoformat(
+                        ts.replace("Z", "+00:00")).astimezone().date()
+                except Exception:
+                    continue
+                if day < start or day > today:
+                    continue
+                msg = d.get("message") or {}
+                u = msg.get("usage")
+                if not u:
+                    continue
+                rid = d.get("requestId") or msg.get("id")
+                if rid:
+                    if rid in seen:
+                        continue
+                    seen.add(rid)
+                v = (u.get("input_tokens", 0) + u.get("output_tokens", 0)
+                     + u.get("cache_creation_input_tokens", 0)
+                     + u.get("cache_read_input_tokens", 0))
+                tot["inp"] += u.get("input_tokens", 0)
+                tot["out"] += u.get("output_tokens", 0)
+                tot["cw"]  += u.get("cache_creation_input_tokens", 0)
+                tot["cr"]  += u.get("cache_read_input_tokens", 0)
+                nreq += 1
+                proj[key] = proj.get(key, 0) + v
+                days[day.isoformat()] = days.get(day.isoformat(), 0) + v
+                m = msg.get("model") or "unknown"
+                models[m] = models.get(m, 0) + v
+                sess[(key, sid)] = sess.get((key, sid), 0) + v
+                if key not in cwds and d.get("cwd"):
+                    cwds[key] = d["cwd"]
+
+    total = sum(tot.values())
+    home = os.path.expanduser("~")
+
+    def name_of(key):
+        p = cwds.get(key)
+        if not p:
+            p = "/" + key.lstrip("-").replace("-", "/")   # 目录名回推，不保证准确
+        return p.replace(home, "~", 1) if p.startswith(home) else p
+
+    if a.json:
+        print(json.dumps({
+            "range": {"start": start.isoformat(), "end": today.isoformat(), "label": label},
+            "total_tokens": total, "requests": nreq, "breakdown": tot,
+            "projects": [{"path": name_of(k), "tokens": v,
+                          "pct": round(v / total * 100, 2) if total else 0}
+                         for k, v in sorted(proj.items(), key=lambda x: -x[1])],
+            "daily": dict(sorted(days.items())),
+            "models": dict(sorted(models.items(), key=lambda x: -x[1])),
+        }, ensure_ascii=False, indent=2))
+        return
+
+    if total == 0:
+        print(f"{label}（{start} ~ {today}）内没有任何用量记录。")
+        print(f"扫描了 {scanned}/{len(files)} 个会话文件。试试 --all 看全部历史。")
+        return
+
+    W = min(shutil.get_terminal_size((100, 24)).columns, 110)
+    BAR = 26
+    line = "─" * W
+
+    print()
+    print(f"  Claude Code Token 用量 · {label}")
+    print(f"  {start} ~ {today}   来源 {base}")
+    print(line)
+    print(f"  总计 {human(total):>10}  tokens        {nreq:,} 次请求        {len(proj)} 个项目")
+    print(f"  输入 {human(tot['inp']):>10}   输出 {human(tot['out']):>9}"
+          f"   缓存写 {human(tot['cw']):>9}   缓存读 {human(tot['cr']):>9}")
+    print(line)
+
+    print(f"\n  按项目\n")
+    rows = sorted(proj.items(), key=lambda x: -x[1])
+    namew = W - BAR - 22
+    for i, (k, v) in enumerate(rows[: a.top], 1):
+        pct = v / total * 100
+        bar = "█" * max(1, round(pct / 100 * BAR)) if pct >= 0.05 else ""
+        print(f"  {i:>2}. {pad(shorten(name_of(k), namew), namew)} {human(v):>8} {pct:>5.1f}% {bar}")
+    if len(rows) > a.top:
+        rest = sum(v for _, v in rows[a.top:])
+        print(f"      {pad('其余 ' + str(len(rows) - a.top) + ' 个项目', namew)} {human(rest):>8} {rest/total*100:>5.1f}%")
+
+    if len(days) > 1:
+        print(f"\n  按天\n")
+        mx = max(days.values())
+        for dstr in sorted(days):
+            v = days[dstr]
+            print(f"  {dstr}  {human(v):>8}  {'▍' * max(1, round(v / mx * 40))}")
+
+    if len(models) > 1:
+        print(f"\n  按模型\n")
+        for m, v in sorted(models.items(), key=lambda x: -x[1]):
+            print(f"  {m:<32} {human(v):>8} {v/total*100:>5.1f}%")
+
+    if a.sessions:
+        print(f"\n  最烧 token 的会话\n")
+        for (k, sid), v in sorted(sess.items(), key=lambda x: -x[1])[:10]:
+            print(f"  {human(v):>8} {v/total*100:>5.1f}%  {pad(shorten(name_of(k), namew-10), namew-10)} {sid[:8]}")
+
+    print(f"\n{line}")
+    print("  注：这是日志里记录的 token 数，与订阅额度的扣减口径不同。")
+    print("      要看额度剩余，在能运行的机器上敲 /usage。")
+    print()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
