@@ -12,7 +12,7 @@
 方式一，从仓库取：
 
 ```bash
-mkdir -p ~/bin && curl -fsSL <RAW_URL> -o ~/bin/cctokens && chmod +x ~/bin/cctokens
+mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/jundongGit/cctokens/main/cctokens -o ~/bin/cctokens && chmod +x ~/bin/cctokens
 ```
 
 方式二，无网络环境：把 `install-oneliner.txt` 的内容整行粘贴到目标机器终端执行，
